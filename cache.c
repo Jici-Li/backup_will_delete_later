@@ -55,6 +55,8 @@ int write_to_L2_cache(uint32_t pa) {
     return write_to_L2_cache_real(pa);
 }
 
+prefetch_policy_t prefetch_policy = PREFETCH_NONE;
+
 void initialize_cache() { 
     int num_blocks = 0;
     int num_sets = 0;
@@ -158,6 +160,34 @@ void update_lru_L2(uint32_t index, uint32_t accessed_way) {
             else 
                 L2_cache[index][way]->lru_counter++;
         }
+    }
+}
+
+void void prefetch_block(uint32_t pa) {
+    if (prefetch_policy != PREFETCH_SEQ) return;
+    
+    uint32_t prefetch_pa = pa + L1_cache_block_size;
+    
+    int L2_num_blocks = L2_cache_size / L2_cache_block_size;
+    int L2_num_sets = L2_num_blocks / L2_cache_associativity;
+    if (L2_num_sets == 0) L2_num_sets = 1;
+    
+    uint32_t index = (pa / L2_cache_block_size) % L2_num_sets;
+    uint32_t tag = pa / (L2_cache_block_size * L2_num_sets);
+    
+    int replace_way = find_lru_way_L2(index);
+    if (L2_cache[index][replace_way]->valid && L2_cache[index][replace_way]->dirty) {
+        memory_write_accesses++;
+        memory_total_accesses++;
+    }
+    L2_cache[index][replace_way]->valid = true;
+    L2_cache[index][replace_way]->tag = tag;
+    L2_cache[index][replace_way]->dirty = false; 
+    L2_cache[index][replace_way]->lru_counter = 0;
+    
+    update_lru_L2(index, replace_way);
+    if (cache_level == 2) {
+        install_to_L2_cache(prefetch_pa);
     }
 }
 
@@ -312,6 +342,10 @@ op_result_t read_from_cache(uint32_t pa) {
     } else {
         L1_cache_misses++;
 
+        if(prefetch_policy!=PREFETCH_NONE){
+            prefetcg_block(pa);
+        }
+
         if (cache_level == 2) {
             if (read_from_L2_cache(pa)) {
                 int replace_way = find_lru_way(index);
@@ -397,6 +431,10 @@ op_result_t write_to_cache(uint32_t pa) {
         return HIT;
     } else {
         L1_cache_misses++;
+
+        if(prefetch_policy!=PREFETCH_NONE){
+            prefetcg_block(pa);
+        }
 
         if (cache_level == 2) {
             if (read_from_L2_cache(pa)) {
@@ -497,7 +535,18 @@ int process_arg_L(int opt, char *optarg) {
 }
 
 int process_arg_P(int opt, char *optarg) { 
-    return 0; 
+    if (strcmp(optarg, "none") == 0) {
+        prefetch_policy = PREFETCH_NONE;
+    } else if (strcmp(optarg, "SEQ") == 0) {
+        prefetch_policy = PREFETCH_SEQ;
+    } else if (strcmp(optarg, "STR") == 0) {
+        prefetch_policy = PREFETCH_STR;
+    } else if (strcmp(optarg, "custom") == 0) {
+        prefetch_policy = PREFETCH_CUSTOM;
+    } else {
+        return 1;
+    }
+    return 0;
 }
 
 static int is_power_of_two(uint32_t x) {
