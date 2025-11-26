@@ -60,6 +60,13 @@ typedef struct {
   uint32_t lru_counter;
 } block_t;
 
+typedef enum {
+    PREFETCH_NONE,
+    PREFETCH_SEQ,
+    PREFETCH_STR,
+    PREFETCH_CUSTOM
+} prefetch_policy_t;
+
 extern block_t ***cache;
 
 #endif /* CACHE_H_ */
