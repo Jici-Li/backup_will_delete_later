@@ -4,7 +4,26 @@
 #include <stdbool.h>
 #include <string.h>  
 
-// Cache statistics counters.
+typedef struct {
+  bool valid;
+  uint32_t tag;
+  bool dirty;
+  uint32_t lru_counter;
+} block_t;
+
+typedef enum {
+    PREFETCH_NONE,
+    PREFETCH_SEQ,
+    PREFETCH_STR,
+    PREFETCH_CUSTOM
+} prefetch_policy_t;
+
+typedef struct {
+    uint32_t lru_counter;
+} lru_info_t;
+
+prefetch_policy_t prefetch_policy = PREFETCH_NONE;
+
 uint32_t L1_cache_total_accesses = 0;
 uint32_t L1_cache_hits = 0;
 uint32_t L1_cache_misses = 0;
@@ -23,7 +42,6 @@ uint32_t memory_total_accesses = 0;
 uint32_t memory_read_accesses = 0;
 uint32_t memory_write_accesses = 0;
 
-// Input parameters to control the cache.
 uint32_t cache_level = 1;
 uint32_t L1_cache_size = 4096;
 uint32_t L1_cache_associativity = 1;
@@ -34,6 +52,17 @@ uint32_t L2_cache_block_size = 4;
 
 block_t ***cache;
 block_t ***L2_cache;
+
+lru_info_t **L1_lru_info;
+lru_info_t **L2_lru_info;
+
+static uint32_t global_time = 1;
+
+static uint32_t log2_u32(uint32_t x);
+static void invalidate_L1_block_if_present(uint32_t pa);
+static void compute_L1_parts(uint32_t pa, uint32_t *index, uint32_t *tag, uint32_t *offset_bits, uint32_t *index_bits, uint32_t num_sets);
+static void compute_L2_parts(uint32_t pa, uint32_t *index, uint32_t *tag, uint32_t *offset_bits, uint32_t *index_bits, uint32_t num_sets);
+static uint32_t reconstruct_pa_from_tag_index(uint32_t tag, uint32_t index, uint32_t offset_bits, uint32_t index_bits);
 
 void update_lru(uint32_t index, uint32_t accessed_way);
 void update_lru_L2(uint32_t index, uint32_t accessed_way);
@@ -56,7 +85,54 @@ int write_to_L2_cache(uint32_t pa) {
     return write_to_L2_cache_real(pa);
 }
 
-prefetch_policy_t prefetch_policy = PREFETCH_NONE;
+static uint32_t log2_u32(uint32_t x) {
+    uint32_t r = 0;
+    while (x > 1) { x >>= 1; r++; }
+    return r;
+}
+
+static uint32_t reconstruct_pa_from_tag_index(uint32_t tag, uint32_t index, uint32_t offset_bits, uint32_t index_bits) {
+    return (tag << (offset_bits + index_bits)) | (index << offset_bits);
+}
+
+static void compute_L1_parts(uint32_t pa, uint32_t *index, uint32_t *tag, uint32_t *offset_bits_ptr, uint32_t *index_bits_ptr, uint32_t num_sets) {
+    uint32_t offset_bits = log2_u32(L1_cache_block_size);
+    uint32_t index_bits = (num_sets > 1) ? log2_u32(num_sets) : 0;
+    uint32_t idx = (num_sets > 1) ? ((pa >> offset_bits) & (num_sets - 1)) : 0;
+    uint32_t t = pa >> (offset_bits + index_bits);
+    if (index) *index = idx;
+    if (tag) *tag = t;
+    if (offset_bits_ptr) *offset_bits_ptr = offset_bits;
+    if (index_bits_ptr) *index_bits_ptr = index_bits;
+}
+
+static void compute_L2_parts(uint32_t pa, uint32_t *index, uint32_t *tag, uint32_t *offset_bits_ptr, uint32_t *index_bits_ptr, uint32_t num_sets) {
+    uint32_t offset_bits = log2_u32(L2_cache_block_size);
+    uint32_t index_bits = (num_sets > 1) ? log2_u32(num_sets) : 0;
+    uint32_t idx = (num_sets > 1) ? ((pa >> offset_bits) & (num_sets - 1)) : 0;
+    uint32_t t = pa >> (offset_bits + index_bits);
+    if (index) *index = idx;
+    if (tag) *tag = t;
+    if (offset_bits_ptr) *offset_bits_ptr = offset_bits;
+    if (index_bits_ptr) *index_bits_ptr = index_bits;
+}
+
+static void invalidate_L1_block_if_present(uint32_t pa) {
+    if (cache_level != 2) return;
+    int num_blocks = L1_cache_size / L1_cache_block_size;
+    int num_sets = num_blocks / L1_cache_associativity;
+    if (num_sets == 0) num_sets = 1;
+    uint32_t index, tag, off_bits, idx_bits;
+    compute_L1_parts(pa, &index, &tag, &off_bits, &idx_bits, (uint32_t)num_sets);
+    for (int way = 0; way < (int)L1_cache_associativity; way++) {
+        if (cache[index][way]->valid && cache[index][way]->tag == tag) {
+            cache[index][way]->valid = false;
+            cache[index][way]->dirty = false;
+            L1_lru_info[index][way].lru_counter = 0;
+        }
+    }
+}
+
 
 void initialize_cache() { 
     int num_blocks = 0;
@@ -68,14 +144,17 @@ void initialize_cache() {
     if (num_sets == 0) num_sets = 1;
 
     cache = malloc(num_sets * sizeof(block_t**));
+    L1_lru_info = malloc(num_sets * sizeof(lru_info_t*)); 
     for (int i = 0; i < num_sets; i++) {
         cache[i] = malloc(L1_cache_associativity * sizeof(block_t*));
+        L1_lru_info[i] = malloc(L1_cache_associativity * sizeof(lru_info_t)); 
         for (int j = 0; j < L1_cache_associativity; j++) {
             cache[i][j] = malloc(sizeof(block_t));
             cache[i][j]->valid = false;
             cache[i][j]->dirty = false;
             cache[i][j]->tag = 0;
-            cache[i][j]->lru_counter = 0;
+
+            L1_lru_info[i][j].lru_counter = 0; 
         }
     }
 
@@ -93,17 +172,22 @@ void initialize_cache() {
         if (L2_num_sets == 0) L2_num_sets = 1;
 
         L2_cache = malloc(L2_num_sets * sizeof(block_t**));
+        L2_lru_info = malloc(L2_num_sets * sizeof(lru_info_t*)); 
         for (int i = 0; i < L2_num_sets; i++) {
             L2_cache[i] = malloc(L2_cache_associativity * sizeof(block_t*));
+            L2_lru_info[i] = malloc(L2_cache_associativity * sizeof(lru_info_t)); 
             for (int j = 0; j < L2_cache_associativity; j++) {
                 L2_cache[i][j] = malloc(sizeof(block_t));
                 L2_cache[i][j]->valid = false;
                 L2_cache[i][j]->dirty = false;
                 L2_cache[i][j]->tag = 0;
-                L2_cache[i][j]->lru_counter = 0;
+                
+                L2_lru_info[i][j].lru_counter = 0; 
             }
         }
     }
+
+    global_time = 1;
 }
 
 void free_cache() {
@@ -120,8 +204,10 @@ void free_cache() {
             free(cache[i][j]);
         }
         free(cache[i]);
+        free(L1_lru_info[i]);
     }
     free(cache);
+    free(L1_lru_info);
 
     if (cache_level == 2) {
         int L2_num_blocks = 0;
@@ -137,83 +223,29 @@ void free_cache() {
                 free(L2_cache[i][j]);
             }
             free(L2_cache[i]);
+            free(L2_lru_info[i]);
         }
         free(L2_cache);
+        free(L2_lru_info);
     }
 }
 
 void update_lru(uint32_t index, uint32_t accessed_way) {
-    for (int way = 0; way < L1_cache_associativity; way++) {
-        if (cache[index][way]->valid) {
-            if (way == accessed_way) 
-                cache[index][way]->lru_counter = 0;
-            else 
-                cache[index][way]->lru_counter++;
-        }
-    }
+    L1_lru_info[index][accessed_way].lru_counter = global_time++;
 }
 
 void update_lru_L2(uint32_t index, uint32_t accessed_way) {
-    for (int way = 0; way < L2_cache_associativity; way++) {
-        if (L2_cache[index][way]->valid) {
-            if (way == accessed_way) 
-                L2_cache[index][way]->lru_counter = 0;
-            else 
-                L2_cache[index][way]->lru_counter++;
-        }
-    }
-}
-
-void prefetch_block(uint32_t pa) {
-    if (prefetch_policy != PREFETCH_SEQ) return;
-    
-    if (cache_level != 2) return; 
-    uint32_t prefetch_pa = pa + L1_cache_block_size;
-    
-    int L2_num_blocks = L2_cache_size / L2_cache_block_size;
-    int L2_num_sets = L2_num_blocks / L2_cache_associativity;
-    if (L2_num_sets == 0) L2_num_sets = 1;
-    
-    uint32_t index = (prefetch_pa / L2_cache_block_size) % L2_num_sets;
-    uint32_t tag = prefetch_pa / (L2_cache_block_size * L2_num_sets);
-
-    bool hit = false;
-    int hit_way = -1;
-    for (int way = 0; way < (int)L2_cache_associativity; way++) {
-        if (L2_cache[index][way]->valid && L2_cache[index][way]->tag == tag) {
-            hit = true;
-            hit_way = way;
-            break;
-        }
-    }
-
-    if (hit) {
-        update_lru_L2(index, hit_way);
-        return; 
-    } else {
-    
-    int replace_way = find_lru_way_L2(index);
-    if (L2_cache[index][replace_way]->valid && L2_cache[index][replace_way]->dirty) {
-        memory_write_accesses++;
-        memory_total_accesses++;
-    }
-    L2_cache[index][replace_way]->valid = true;
-    L2_cache[index][replace_way]->tag = tag;
-    L2_cache[index][replace_way]->dirty = false; 
-    L2_cache[index][replace_way]->lru_counter = 0;
-    
-    update_lru_L2(index, replace_way);
-        return;
-    }
+    L2_lru_info[index][accessed_way].lru_counter = global_time++;
 }
 
 int find_lru_way(uint32_t index) {
-    int lru_way = 0;
-    uint32_t max_counter = 0;
+    int lru_way = -1;
+    uint32_t oldest_time = global_time + 1; // 初始化为未来时间
+    
     for (int way = 0; way < L1_cache_associativity; way++) {
         if (!cache[index][way]->valid) return way;
-        if (cache[index][way]->lru_counter > max_counter) {
-            max_counter = cache[index][way]->lru_counter;
+        if (lru_way == -1 || L1_lru_info[index][way].lru_counter < oldest_time) {
+            oldest_time = L1_lru_info[index][way].lru_counter;
             lru_way = way;
         }
     }
@@ -221,17 +253,54 @@ int find_lru_way(uint32_t index) {
 }
 
 int find_lru_way_L2(uint32_t index) {
-    int lru_way = 0;
-    uint32_t max_counter = 0;
+    int empty_way = -1;
     for (int way = 0; way < L2_cache_associativity; way++) {
         if (!L2_cache[index][way]->valid) return way;
-        if (L2_cache[index][way]->lru_counter > max_counter) {
-            max_counter = L2_cache[index][way]->lru_counter;
-            lru_way = way;
+        if (empty_way == -1 || L2_lru_info[index][way].lru_counter < L2_lru_info[index][empty_way].lru_counter) {
+            empty_way = way;
         }
     }
-    return lru_way;
+    return (empty_way == -1) ? 0 : empty_way;
 }
+
+void prefetch_block(uint32_t pa) {
+    if (prefetch_policy != PREFETCH_SEQ) return;
+    if (cache_level != 2) return;
+
+    uint32_t next_pa = pa + L1_cache_block_size; 
+
+    int L2_num_blocks = L2_cache_size / L2_cache_block_size;
+    int L2_num_sets = L2_num_blocks / L2_cache_associativity;
+    if (L2_num_sets == 0) L2_num_sets = 1;
+
+    uint32_t L2_index, L2_tag, off_b, idx_b;
+    compute_L2_parts(next_pa, &L2_index, &L2_tag, &off_b, &idx_b, (uint32_t)L2_num_sets);
+
+    for (int way = 0; way < (int)L2_cache_associativity; way++) {
+        if (L2_cache[L2_index][way]->valid && L2_cache[L2_index][way]->tag == L2_tag) {
+            update_lru_L2(L2_index, way);
+            return;
+        }
+    }
+
+    memory_total_accesses++;
+    memory_read_accesses++;
+
+    int replace_way = find_lru_way_L2(L2_index);
+
+    if (L2_cache[L2_index][replace_way]->valid && L2_cache[L2_index][replace_way]->dirty) {
+        memory_total_accesses++;
+        memory_write_accesses++;
+        uint32_t victim_pa = reconstruct_pa_from_tag_index(L2_cache[L2_index][replace_way]->tag, L2_index, off_b, idx_b);
+        invalidate_L1_block_if_present(victim_pa);
+    }
+
+    L2_cache[L2_index][replace_way]->valid = true;
+    L2_cache[L2_index][replace_way]->tag = L2_tag;
+    L2_cache[L2_index][replace_way]->dirty = false;
+    L2_lru_info[L2_index][replace_way].lru_counter = global_time++;
+}
+
 
 int read_from_L2_cache_real(uint32_t pa) {
     L2_cache_total_accesses++;
@@ -245,8 +314,8 @@ int read_from_L2_cache_real(uint32_t pa) {
     }
     if (L2_num_sets == 0) L2_num_sets = 1;
 
-    uint32_t index = (pa / L2_cache_block_size) % L2_num_sets;
-    uint32_t tag = pa / (L2_cache_block_size * L2_num_sets);
+    uint32_t index, tag, off_b, idx_b;
+    compute_L2_parts(pa, &index, &tag, &off_b, &idx_b, (uint32_t)L2_num_sets);
 
     for (int way = 0; way < (int)L2_cache_associativity; way++) {
         if (L2_cache[index][way]->valid && L2_cache[index][way]->tag == tag) {
@@ -273,8 +342,8 @@ int write_to_L2_cache_real(uint32_t pa) {
     }
     if (L2_num_sets == 0) L2_num_sets = 1;
 
-    uint32_t index = (pa / L2_cache_block_size) % L2_num_sets;
-    uint32_t tag = pa / (L2_cache_block_size * L2_num_sets);
+    uint32_t index, tag, off_b, idx_b;
+    compute_L2_parts(pa, &index, &tag, &off_b, &idx_b, (uint32_t)L2_num_sets);
 
     for (int way = 0; way < (int)L2_cache_associativity; way++) {
         if (L2_cache[index][way]->valid && L2_cache[index][way]->tag == tag) {
@@ -290,40 +359,43 @@ int write_to_L2_cache_real(uint32_t pa) {
     int replace_way = find_lru_way_L2(index);
 
     if (L2_cache[index][replace_way]->valid && L2_cache[index][replace_way]->dirty) {
-        memory_write_accesses++;
         memory_total_accesses++;
+        memory_write_accesses++;
+        uint32_t victim_pa = reconstruct_pa_from_tag_index(L2_cache[index][replace_way]->tag, index, off_b, idx_b);
+        invalidate_L1_block_if_present(victim_pa);
     }
 
     L2_cache[index][replace_way]->valid = true;
     L2_cache[index][replace_way]->tag = tag;
     L2_cache[index][replace_way]->dirty = true;
-    L2_cache[index][replace_way]->lru_counter = 0;
+    L2_lru_info[index][replace_way].lru_counter = global_time++;
     
-    update_lru_L2(index, replace_way);
     return 0; 
 }
-
 
 void install_to_L2_cache(uint32_t pa) {
     int L2_num_blocks = L2_cache_size / L2_cache_block_size;
     int L2_num_sets = L2_num_blocks / L2_cache_associativity;
     if (L2_num_sets == 0) L2_num_sets = 1;
     
-    uint32_t index = (pa / L2_cache_block_size) % L2_num_sets;
-    uint32_t tag = pa / (L2_cache_block_size * L2_num_sets);
+    uint32_t index, tag, off_b, idx_b;
+    compute_L2_parts(pa, &index, &tag, &off_b, &idx_b, (uint32_t)L2_num_sets);
     
     int replace_way = find_lru_way_L2(index);
     if (L2_cache[index][replace_way]->valid && L2_cache[index][replace_way]->dirty) {
-        memory_write_accesses++;
         memory_total_accesses++;
+        memory_write_accesses++;
+        uint32_t victim_pa = reconstruct_pa_from_tag_index(L2_cache[index][replace_way]->tag, index, off_b, idx_b);
+        invalidate_L1_block_if_present(victim_pa);
     }
     L2_cache[index][replace_way]->valid = true;
     L2_cache[index][replace_way]->tag = tag;
     L2_cache[index][replace_way]->dirty = false; 
-    L2_cache[index][replace_way]->lru_counter = 0;
+    L2_lru_info[index][replace_way].lru_counter = global_time++;
     
     update_lru_L2(index, replace_way);
 }
+
 
 op_result_t read_from_cache(uint32_t pa) {
     L1_cache_total_accesses++;
@@ -337,8 +409,8 @@ op_result_t read_from_cache(uint32_t pa) {
     }
     if (num_sets == 0) num_sets = 1;
 
-    uint32_t index = (pa / L1_cache_block_size) % num_sets;
-    uint32_t tag = pa / (L1_cache_block_size * num_sets);
+    uint32_t index, tag, off_b, idx_b;
+    compute_L1_parts(pa, &index, &tag, &off_b, &idx_b, (uint32_t)num_sets);
 
     bool hit = false;
     int hit_way = -1;
@@ -365,17 +437,16 @@ op_result_t read_from_cache(uint32_t pa) {
         if (cache_level == 2) {
             if (read_from_L2_cache(pa)) {
                 int replace_way = find_lru_way(index);
-          
-                if (cache[index][replace_way]->valid && cache[index][replace_way]->dirty) {
 
-                  uint32_t victim_pa = (cache[index][replace_way]->tag * (num_sets * L1_cache_block_size)) + (index * L1_cache_block_size);
-                  write_to_L2_cache(victim_pa);
+                if (cache[index][replace_way]->valid && cache[index][replace_way]->dirty) {
+                    uint32_t victim_pa = reconstruct_pa_from_tag_index(cache[index][replace_way]->tag, index, off_b, idx_b);
+                    write_to_L2_cache(victim_pa);
                 }
 
                 cache[index][replace_way]->valid = true;
                 cache[index][replace_way]->tag = tag;
                 cache[index][replace_way]->dirty = false;
-                cache[index][replace_way]->lru_counter = 0;
+                L1_lru_info[index][replace_way].lru_counter = global_time++;
                 update_lru(index, replace_way);
             } else {
                 memory_total_accesses++;
@@ -384,15 +455,15 @@ op_result_t read_from_cache(uint32_t pa) {
                 install_to_L2_cache(pa);
 
                 int replace_way = find_lru_way(index);
-                 if (cache[index][replace_way]->valid && cache[index][replace_way]->dirty) {
-                    uint32_t victim_pa = (cache[index][replace_way]->tag * (num_sets * L1_cache_block_size)) + (index * L1_cache_block_size);
+                if (cache[index][replace_way]->valid && cache[index][replace_way]->dirty) {
+                    uint32_t victim_pa = reconstruct_pa_from_tag_index(cache[index][replace_way]->tag, index, off_b, idx_b);
                     write_to_L2_cache(victim_pa);
                 }
 
                 cache[index][replace_way]->valid = true;
                 cache[index][replace_way]->tag = tag;
                 cache[index][replace_way]->dirty = false;
-                cache[index][replace_way]->lru_counter = 0;
+                L1_lru_info[index][replace_way].lru_counter = global_time++;
                 update_lru(index, replace_way);
             }
         } else {
@@ -401,14 +472,14 @@ op_result_t read_from_cache(uint32_t pa) {
 
             int replace_way = find_lru_way(index);
             if (cache[index][replace_way]->valid && cache[index][replace_way]->dirty) {
-                memory_write_accesses++;
                 memory_total_accesses++;
+                memory_write_accesses++;
             }
 
             cache[index][replace_way]->valid = true;
             cache[index][replace_way]->tag = tag;
             cache[index][replace_way]->dirty = false;
-            cache[index][replace_way]->lru_counter = 0;
+            L1_lru_info[index][replace_way].lru_counter = global_time++;
             update_lru(index, replace_way);
         }
         return MISS;
@@ -427,8 +498,8 @@ op_result_t write_to_cache(uint32_t pa) {
     }
     if (num_sets == 0) num_sets = 1;
 
-    uint32_t index = (pa / L1_cache_block_size) % num_sets;
-    uint32_t tag = pa / (L1_cache_block_size * num_sets);
+    uint32_t index, tag, off_b, idx_b;
+    compute_L1_parts(pa, &index, &tag, &off_b, &idx_b, (uint32_t)num_sets);
 
     bool hit = false;
     int hit_way = -1;
@@ -456,62 +527,48 @@ op_result_t write_to_cache(uint32_t pa) {
         if (cache_level == 2) {
             if (read_from_L2_cache(pa)) {
                 int replace_way = find_lru_way(index);
-                  if (cache[index][replace_way]->valid && cache[index][replace_way]->dirty) {
-                    uint32_t victim_pa = (cache[index][replace_way]->tag * (num_sets * L1_cache_block_size)) + (index * L1_cache_block_size);
+               
+                if (cache[index][replace_way]->valid && cache[index][replace_way]->dirty) {
+                    uint32_t victim_pa = reconstruct_pa_from_tag_index(cache[index][replace_way]->tag, index, off_b, idx_b);
                     write_to_L2_cache(victim_pa);
                 }
-                
                 cache[index][replace_way]->valid = true;
                 cache[index][replace_way]->tag = tag;
                 cache[index][replace_way]->dirty = true;
-                cache[index][replace_way]->lru_counter = 0;
+                L1_lru_info[index][replace_way].lru_counter = global_time++;
                 update_lru(index, replace_way);
 
-                int L2_num_blocks = L2_cache_size / L2_cache_block_size;
-                int L2_num_sets = L2_num_blocks / L2_cache_associativity;
-                if (L2_num_sets == 0) L2_num_sets = 1;
-                uint32_t L2_index = (pa / L2_cache_block_size) % L2_num_sets;
-                uint32_t L2_tag = pa / (L2_cache_block_size * L2_num_sets);
-
-                for (int way = 0; way < (int)L2_cache_associativity; way++) {
-                    if (L2_cache[L2_index][way]->valid && L2_cache[L2_index][way]->tag == L2_tag) {
-                        L2_cache[L2_index][way]->valid = false; // Invalidate L2 copy
-                        break;
-                    }
-                }
-                
             } else {
                 memory_total_accesses++;
                 memory_read_accesses++;
-                
+                install_to_L2_cache(pa);
+
                 int replace_way = find_lru_way(index);
-                 if (cache[index][replace_way]->valid && cache[index][replace_way]->dirty) {
-                    uint32_t victim_pa = (cache[index][replace_way]->tag * (num_sets * L1_cache_block_size)) + (index * L1_cache_block_size);
+                if (cache[index][replace_way]->valid && cache[index][replace_way]->dirty) {
+                    uint32_t victim_pa = reconstruct_pa_from_tag_index(cache[index][replace_way]->tag, index, off_b, idx_b);
                     write_to_L2_cache(victim_pa);
                 }
-                
+
                 cache[index][replace_way]->valid = true;
                 cache[index][replace_way]->tag = tag;
                 cache[index][replace_way]->dirty = true;
-                cache[index][replace_way]->lru_counter = 0;
+                L1_lru_info[index][replace_way].lru_counter = global_time++;
                 update_lru(index, replace_way);
-
-                install_to_L2_cache(pa);
             }
         } else {
             int replace_way = find_lru_way(index);
             if (cache[index][replace_way]->valid && cache[index][replace_way]->dirty) {
-                memory_write_accesses++;
                 memory_total_accesses++;
+                memory_write_accesses++;
             }
 
-            memory_read_accesses++;
             memory_total_accesses++;
+            memory_read_accesses++;
 
             cache[index][replace_way]->valid = true;
             cache[index][replace_way]->tag = tag;
             cache[index][replace_way]->dirty = true;
-            cache[index][replace_way]->lru_counter = 0;
+            L1_lru_info[index][replace_way].lru_counter = global_time++;
             update_lru(index, replace_way);
         }
         return MISS;
@@ -589,13 +646,14 @@ int check_cache_parameters_valid() {
     if (L1_cache_block_size == 0) return -1;
     if (L1_cache_associativity == 0) return -1;
 
+    if (L1_cache_size < 4 || L1_cache_size > 16384 || !is_power_of_two(L1_cache_size)) return -1;
+
+    if (L1_cache_block_size < 4 || L1_cache_block_size > L1_cache_size || !is_power_of_two(L1_cache_block_size)) return -1;
+
     if (L1_cache_size % L1_cache_block_size != 0) return -1;
 
-    int blocks = L1_cache_size / L1_cache_block_size;
-    if (blocks % L1_cache_associativity != 0) return -1;
-
-    if (!is_power_of_two(L1_cache_size)) return -1;
-    if (!is_power_of_two(L1_cache_block_size)) return -1;
+    int total_blocks = L1_cache_size / L1_cache_block_size;
+    if (L1_cache_associativity > total_blocks || !is_power_of_two(L1_cache_associativity)) return -1;
 
     return 0;
 }
