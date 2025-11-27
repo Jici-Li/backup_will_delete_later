@@ -57,15 +57,7 @@ typedef struct {
   bool valid;
   uint32_t tag;
   bool dirty;
-  uint32_t lru_counter;
 } block_t;
-
-typedef enum {
-    PREFETCH_NONE,
-    PREFETCH_SEQ,
-    PREFETCH_STR,
-    PREFETCH_CUSTOM
-} prefetch_policy_t;
 
 extern block_t ***cache;
 
